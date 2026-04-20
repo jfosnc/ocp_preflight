@@ -205,6 +205,23 @@ Show help:
 bash ./ocp-preflight.sh --help
 ```
 
+## Linting
+
+The repository includes a GitHub Actions workflow at [lint.yml](/c:/Users/jfosn/OneDrive/Documents/work/ocp_preflight/.github/workflows/lint.yml:1) that runs on pushes to `main` and on pull requests.
+
+It currently performs:
+
+- `bash -n ocp-preflight.sh`
+- `bash -n ocp-preflight.conf`
+- `shellcheck ocp-preflight.sh`
+- `bash tests/run-tests.sh`
+
+The test runner at [run-tests.sh](/c:/Users/jfosn/OneDrive/Documents/work/ocp_preflight/tests/run-tests.sh:1) uses mocked `dig`, `curl`, `nc`, and `ssh` commands to validate:
+
+- config parsing success and failure cases
+- pre-bootstrap HAProxy membership expectations
+- post-bootstrap HAProxy membership expectations
+
 ## Config Validation
 
 Before any runtime checks execute, the script validates:
@@ -246,14 +263,6 @@ A few implementation details are worth knowing if you plan to extend this projec
 ## Suggested Workflow
 
 1. Copy `ocp-preflight.conf` and tailor it to the target environment.
-2. Run the script from an installer or admin workstation that has network access to the VIPs, DNS server, and optional load balancer.
+2. Run the script from an installer or admin workstation that has network access to the VIPs, DNS server, and load balancer.
 3. Resolve any `[FAIL]` results before proceeding with installation.
 4. Re-run after infrastructure changes or after the bootstrap phase transitions.
-
-## Remaining Improvement Ideas
-
-Natural next enhancements for this project would be:
-
-- add automated tests for config parsing and phase-specific LB logic
-- add a linting or CI workflow for shell validation
-- add optional checks for specific ingress routes after the cluster becomes available
