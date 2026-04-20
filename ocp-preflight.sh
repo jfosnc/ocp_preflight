@@ -1,17 +1,84 @@
-ocp-pxe-preflight.sh
-
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-CONFIG_FILE="${1:-./ocp-preflight.conf}"
+usage() {
+  cat <<'EOF'
+Usage:
+  ocp-preflight.sh [config-file]
+  ocp-preflight.sh -c <config-file>
+  ocp-preflight.sh --config <config-file>
+  ocp-preflight.sh --validate-config [config-file]
+  ocp-preflight.sh -h | --help
+
+Options:
+  -c, --config <file>     Path to the configuration file
+      --validate-config   Validate configuration and exit without running checks
+  -h, --help              Show this help text
+EOF
+}
+
+CONFIG_FILE="./ocp-preflight.conf"
+VALIDATE_ONLY="no"
+
+while (($# > 0)); do
+  case "$1" in
+    -c|--config)
+      [[ $# -ge 2 ]] || { echo "ERROR: missing value for $1"; usage; exit 2; }
+      CONFIG_FILE="$2"
+      shift 2
+      ;;
+    --validate-config)
+      VALIDATE_ONLY="yes"
+      shift
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    --)
+      shift
+      break
+      ;;
+    -*)
+      echo "ERROR: unknown option: $1"
+      usage
+      exit 2
+      ;;
+    *)
+      if [[ "${CONFIG_FILE}" != "./ocp-preflight.conf" ]]; then
+        echo "ERROR: multiple config files provided"
+        usage
+        exit 2
+      fi
+      CONFIG_FILE="$1"
+      shift
+      ;;
+  esac
+done
+
+if (($# > 0)); then
+  echo "ERROR: unexpected arguments: $*"
+  usage
+  exit 2
+fi
 
 if [[ ! -f "${CONFIG_FILE}" ]]; then
   echo "ERROR: config file not found: ${CONFIG_FILE}"
   exit 2
 fi
 
+if ! bash -n "${CONFIG_FILE}" >/dev/null 2>&1; then
+  echo "ERROR: config file has invalid shell syntax: ${CONFIG_FILE}"
+  exit 2
+fi
+
 # shellcheck disable=SC1090
 source "${CONFIG_FILE}"
+
+declare -p MASTER_NODES >/dev/null 2>&1 || MASTER_NODES=()
+declare -p WORKER_NODES >/dev/null 2>&1 || WORKER_NODES=()
+declare -p INGRESS_NODES >/dev/null 2>&1 || INGRESS_NODES=()
+declare -p BOOT_ARTIFACTS >/dev/null 2>&1 || BOOT_ARTIFACTS=()
 
 PASS_COUNT=0
 FAIL_COUNT=0
@@ -22,27 +89,124 @@ fail() { echo "[FAIL] $*"; ((FAIL_COUNT+=1)); }
 warn() { echo "[WARN] $*"; ((WARN_COUNT+=1)); }
 info() { echo "[INFO] $*"; }
 
+die() {
+  echo "ERROR: $*"
+  exit 2
+}
+
 need_cmd() {
   local cmd
   for cmd in "$@"; do
-    command -v "${cmd}" >/dev/null 2>&1 || {
-      echo "ERROR: required command not found: ${cmd}"
-      exit 2
-    }
+    command -v "${cmd}" >/dev/null 2>&1 || die "required command not found: ${cmd}"
   done
 }
 
+is_ipv4() {
+  local ip="$1"
+  local octet
+  [[ "${ip}" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || return 1
+  IFS='.' read -r -a octets <<<"${ip}"
+  for octet in "${octets[@]}"; do
+    [[ "${octet}" =~ ^[0-9]+$ ]] || return 1
+    ((octet >= 0 && octet <= 255)) || return 1
+  done
+}
+
+is_yes_no() {
+  [[ "$1" == "yes" || "$1" == "no" ]]
+}
+
+require_nonempty() {
+  local name="$1"
+  local value="${!name:-}"
+  [[ -n "${value}" ]] || die "required config value is empty: ${name}"
+}
+
+tuple_name() { echo "${1%%:*}"; }
+tuple_ip()   { echo "${1##*:}"; }
+
+validate_tuple() {
+  local tuple="$1"
+  local label="$2"
+  [[ "${tuple}" == *:* ]] || die "${label} must use shortname:ip format, got '${tuple}'"
+
+  local short ip
+  short="$(tuple_name "${tuple}")"
+  ip="$(tuple_ip "${tuple}")"
+
+  [[ -n "${short}" ]] || die "${label} has an empty node name"
+  [[ "${short}" =~ ^[A-Za-z0-9._-]+$ ]] || die "${label} has an invalid node name: ${short}"
+  is_ipv4 "${ip}" || die "${label} has an invalid IPv4 address: ${ip}"
+}
+
+validate_config() {
+  require_nonempty PHASE
+  require_nonempty DNS_SERVER
+  require_nonempty CLUSTER_NAME
+  require_nonempty BASE_DOMAIN
+  require_nonempty API_VIP
+  require_nonempty INGRESS_VIP
+  require_nonempty BOOTSTRAP_NODE
+
+  [[ "${PHASE}" == "pre-bootstrap" || "${PHASE}" == "post-bootstrap" ]] || \
+    die "PHASE must be 'pre-bootstrap' or 'post-bootstrap', got '${PHASE}'"
+
+  is_ipv4 "${DNS_SERVER}" || die "DNS_SERVER must be an IPv4 address, got '${DNS_SERVER}'"
+  is_ipv4 "${API_VIP}" || die "API_VIP must be an IPv4 address, got '${API_VIP}'"
+  is_ipv4 "${INGRESS_VIP}" || die "INGRESS_VIP must be an IPv4 address, got '${INGRESS_VIP}'"
+
+  validate_tuple "${BOOTSTRAP_NODE}" "BOOTSTRAP_NODE"
+  ((${#MASTER_NODES[@]} > 0)) || die "MASTER_NODES must contain at least one node"
+  ((${#INGRESS_NODES[@]} > 0)) || die "INGRESS_NODES must contain at least one node"
+
+  local tuple
+  for tuple in "${MASTER_NODES[@]}"; do
+    validate_tuple "${tuple}" "MASTER_NODES entry"
+  done
+  for tuple in "${WORKER_NODES[@]}"; do
+    validate_tuple "${tuple}" "WORKER_NODES entry"
+  done
+  for tuple in "${INGRESS_NODES[@]}"; do
+    validate_tuple "${tuple}" "INGRESS_NODES entry"
+  done
+
+  is_yes_no "${ENABLE_LB_SSH_CHECK:-no}" || die "ENABLE_LB_SSH_CHECK must be 'yes' or 'no'"
+  is_yes_no "${ENABLE_BOOT_ARTIFACT_CHECK:-no}" || die "ENABLE_BOOT_ARTIFACT_CHECK must be 'yes' or 'no'"
+  is_yes_no "${REQUIRE_PINNED_NIC:-no}" || die "REQUIRE_PINNED_NIC must be 'yes' or 'no'"
+
+  if [[ "${ENABLE_LB_SSH_CHECK:-no}" == "yes" ]]; then
+    require_nonempty LB_HOST
+    require_nonempty LB_SSH_USER
+    require_nonempty HAPROXY_CFG
+  fi
+
+  if [[ "${ENABLE_BOOT_ARTIFACT_CHECK:-no}" == "yes" ]]; then
+    require_nonempty BOOT_METHOD
+    [[ "${BOOT_METHOD}" == "ipxe" || "${BOOT_METHOD}" == "pxe" || "${BOOT_METHOD}" == "generic" ]] || \
+      die "BOOT_METHOD must be one of: ipxe, pxe, generic"
+    ((${#BOOT_ARTIFACTS[@]} > 0)) || die "BOOT_ARTIFACTS must contain at least one entry when boot artifact checks are enabled"
+  fi
+
+  if [[ "${REQUIRE_PINNED_NIC:-no}" == "yes" ]]; then
+    require_nonempty EXPECT_BOOT_NIC
+  fi
+}
+
 need_cmd dig curl nc awk grep sed tr
+validate_config
+
+if [[ "${VALIDATE_ONLY}" == "yes" ]]; then
+  info "Configuration is valid: ${CONFIG_FILE}"
+  exit 0
+fi
 
 cluster_domain="${CLUSTER_NAME}.${BASE_DOMAIN}"
 api_fqdn="api.${cluster_domain}"
 api_int_fqdn="api-int.${cluster_domain}"
-apps_test_fqdn="preflight.apps.${cluster_domain}"
+apps_test_fqdn="wildcard-preflight.apps.${cluster_domain}"
+ignition_base_url="https://${api_int_fqdn}:22623"
 
 trim_dot() { sed 's/\.$//'; }
-
-tuple_name() { echo "${1%%:*}"; }
-tuple_ip()   { echo "${1##*:}"; }
 
 node_fqdn() {
   local short="$1"
@@ -111,6 +275,34 @@ tcp_check() {
   fi
 }
 
+http_check() {
+  local url="$1"
+  local label="$2"
+  local curl_args=(
+    -fsS
+    --connect-timeout 5
+    --max-time 20
+    -o /dev/null
+    -w '%{http_code}'
+  )
+
+  if [[ "${url}" =~ ^https://[^/]+:22623/ ]]; then
+    curl_args+=(-k)
+  fi
+
+  local status
+  if ! status="$(curl "${curl_args[@]}" "${url}" 2>/dev/null)"; then
+    fail "${label} not reachable: ${url}"
+    return
+  fi
+
+  if [[ "${status}" =~ ^2[0-9][0-9]$ ]]; then
+    pass "${label} reachable: ${url} (HTTP ${status})"
+  else
+    fail "${label} returned HTTP ${status}: ${url}"
+  fi
+}
+
 fetch_text() {
   local src="$1"
   if [[ "${src}" =~ ^https?:// ]]; then
@@ -172,7 +364,6 @@ check_lb_config() {
 
   local tuple short fqdn
 
-  # 6443 and 22623 must always include masters
   for tuple in "${MASTER_NODES[@]}"; do
     short="$(tuple_name "${tuple}")"
     fqdn="$(node_fqdn "${short}")"
@@ -190,7 +381,6 @@ check_lb_config() {
     fi
   done
 
-  # Bootstrap membership depends on phase
   if [[ "${PHASE}" == "pre-bootstrap" ]]; then
     if cfg_has_server_port "${cfg}" "${b_short}" 6443 || cfg_has_server_port "${cfg}" "${b_fqdn}" 6443; then
       pass "Pre-bootstrap LB config includes bootstrap on 6443"
@@ -217,7 +407,6 @@ check_lb_config() {
     fi
   fi
 
-  # Ingress backends
   for tuple in "${INGRESS_NODES[@]}"; do
     short="$(tuple_name "${tuple}")"
     fqdn="$(node_fqdn "${short}")"
@@ -300,13 +489,19 @@ check_boot_artifact() {
   done < <(extract_urls <<<"${content}")
 }
 
+check_ignition_endpoints() {
+  local role
+  for role in master worker; do
+    http_check "${ignition_base_url}/config/${role}" "Ignition endpoint for ${role}"
+  done
+}
+
 echo
 info "Cluster domain: ${cluster_domain}"
 info "Phase: ${PHASE}"
 info "DNS server: ${DNS_SERVER}"
 echo
 
-# DNS checks
 check_a_record "${api_fqdn}" "${API_VIP}"
 check_a_record "${api_int_fqdn}" "${API_VIP}"
 check_a_record "${apps_test_fqdn}" "${INGRESS_VIP}"
@@ -332,6 +527,10 @@ tcp_check "${API_VIP}" 6443
 tcp_check "${API_VIP}" 22623
 tcp_check "${INGRESS_VIP}" 80
 tcp_check "${INGRESS_VIP}" 443
+
+echo
+info "Checking ignition endpoints"
+check_ignition_endpoints
 
 echo
 if [[ "${ENABLE_LB_SSH_CHECK:-no}" == "yes" ]]; then
