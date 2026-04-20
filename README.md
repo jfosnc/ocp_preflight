@@ -147,7 +147,10 @@ When enabled, the script attempts to:
 - read the HAProxy config with `sudo cat`
 - inspect listening ports with `ss -lntH`
 
-If SSH or config retrieval fails, the script reports a warning and skips backend membership checks.
+Listener checks and backend membership checks are attempted independently.
+
+- If HAProxy config retrieval fails, the script reports a warning and skips backend membership checks.
+- If listener inspection fails, the script reports a warning and skips listener checks.
 
 ### Optional Boot Artifact Checks
 
@@ -198,6 +201,8 @@ Validate only, without running network checks:
 ```bash
 bash ./ocp-preflight.sh --validate-config
 ```
+
+In `--validate-config` mode, the script validates shell syntax and config values without requiring runtime tools such as `dig`, `curl`, or `nc`.
 
 Show help:
 

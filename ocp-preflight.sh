@@ -192,13 +192,14 @@ validate_config() {
   fi
 }
 
-need_cmd dig curl nc awk grep sed tr
 validate_config
 
 if [[ "${VALIDATE_ONLY}" == "yes" ]]; then
   info "Configuration is valid: ${CONFIG_FILE}"
   exit 0
 fi
+
+need_cmd dig curl nc awk grep sed tr
 
 cluster_domain="${CLUSTER_NAME}.${BASE_DOMAIN}"
 api_fqdn="api.${cluster_domain}"
@@ -329,11 +330,49 @@ ssh_lb() {
   ssh -o BatchMode=yes -o ConnectTimeout=5 "${LB_SSH_USER}@${LB_HOST}" "$@"
 }
 
-cfg_has_server_port() {
+backend_section() {
   local cfg="$1"
-  local host="$2"
-  local port="$3"
-  grep -Eiq "server[[:space:]].*(${host}|${host//./\\.}).*:${port}([[:space:]]|$)" <<<"${cfg}"
+  local backend="$2"
+  awk -v backend="${backend}" '
+    $1 == "backend" {
+      if (in_backend) {
+        exit
+      }
+      in_backend = ($2 == backend)
+      next
+    }
+    in_backend {
+      print
+    }
+  ' <<<"${cfg}"
+}
+
+backend_has_server_port() {
+  local cfg="$1"
+  local backend="$2"
+  local host="$3"
+  local port="$4"
+  local section
+  section="$(backend_section "${cfg}" "${backend}")"
+  [[ -n "${section}" ]] || return 1
+  grep -Eiq "server[[:space:]].*(${host}|${host//./\\.}).*:${port}([[:space:]]|$)" <<<"${section}"
+}
+
+check_lb_listeners() {
+  local listeners
+  if ! listeners="$(ssh_lb "sudo ss -lntH | awk '{print \$4}'" 2>/dev/null)"; then
+    warn "Could not inspect load balancer listeners over SSH from ${LB_HOST}; skipping listener checks"
+    return 0
+  fi
+
+  local port
+  for port in 6443 22623 80 443; do
+    if grep -Eq "[:.]${port}$" <<<"${listeners}"; then
+      pass "Load balancer is listening on ${port}"
+    else
+      fail "Load balancer is not listening on ${port}"
+    fi
+  done
 }
 
 check_lb_config() {
@@ -349,15 +388,6 @@ check_lb_config() {
     warn "HAProxy config does not show /readyz health check for API"
   fi
 
-  local port
-  for port in 6443 22623 80 443; do
-    if ssh_lb "sudo ss -lntH | awk '{print \$4}'" 2>/dev/null | grep -Eq "[:.]${port}$"; then
-      pass "Load balancer is listening on ${port}"
-    else
-      fail "Load balancer is not listening on ${port}"
-    fi
-  done
-
   local b_short b_fqdn
   b_short="$(tuple_name "${BOOTSTRAP_NODE}")"
   b_fqdn="$(node_fqdn "${b_short}")"
@@ -368,13 +398,13 @@ check_lb_config() {
     short="$(tuple_name "${tuple}")"
     fqdn="$(node_fqdn "${short}")"
 
-    if cfg_has_server_port "${cfg}" "${short}" 6443 || cfg_has_server_port "${cfg}" "${fqdn}" 6443; then
+    if backend_has_server_port "${cfg}" "api_backend" "${short}" 6443 || backend_has_server_port "${cfg}" "api_backend" "${fqdn}" 6443; then
       pass "LB config includes ${short} on 6443"
     else
       fail "LB config missing ${short} on 6443"
     fi
 
-    if cfg_has_server_port "${cfg}" "${short}" 22623 || cfg_has_server_port "${cfg}" "${fqdn}" 22623; then
+    if backend_has_server_port "${cfg}" "machine_config_backend" "${short}" 22623 || backend_has_server_port "${cfg}" "machine_config_backend" "${fqdn}" 22623; then
       pass "LB config includes ${short} on 22623"
     else
       fail "LB config missing ${short} on 22623"
@@ -382,25 +412,25 @@ check_lb_config() {
   done
 
   if [[ "${PHASE}" == "pre-bootstrap" ]]; then
-    if cfg_has_server_port "${cfg}" "${b_short}" 6443 || cfg_has_server_port "${cfg}" "${b_fqdn}" 6443; then
+    if backend_has_server_port "${cfg}" "api_backend" "${b_short}" 6443 || backend_has_server_port "${cfg}" "api_backend" "${b_fqdn}" 6443; then
       pass "Pre-bootstrap LB config includes bootstrap on 6443"
     else
       fail "Pre-bootstrap LB config missing bootstrap on 6443"
     fi
 
-    if cfg_has_server_port "${cfg}" "${b_short}" 22623 || cfg_has_server_port "${cfg}" "${b_fqdn}" 22623; then
+    if backend_has_server_port "${cfg}" "machine_config_backend" "${b_short}" 22623 || backend_has_server_port "${cfg}" "machine_config_backend" "${b_fqdn}" 22623; then
       pass "Pre-bootstrap LB config includes bootstrap on 22623"
     else
       fail "Pre-bootstrap LB config missing bootstrap on 22623"
     fi
   else
-    if cfg_has_server_port "${cfg}" "${b_short}" 6443 || cfg_has_server_port "${cfg}" "${b_fqdn}" 6443; then
+    if backend_has_server_port "${cfg}" "api_backend" "${b_short}" 6443 || backend_has_server_port "${cfg}" "api_backend" "${b_fqdn}" 6443; then
       fail "Post-bootstrap LB config still includes bootstrap on 6443"
     else
       pass "Post-bootstrap LB config has bootstrap removed from 6443"
     fi
 
-    if cfg_has_server_port "${cfg}" "${b_short}" 22623 || cfg_has_server_port "${cfg}" "${b_fqdn}" 22623; then
+    if backend_has_server_port "${cfg}" "machine_config_backend" "${b_short}" 22623 || backend_has_server_port "${cfg}" "machine_config_backend" "${b_fqdn}" 22623; then
       fail "Post-bootstrap LB config still includes bootstrap on 22623"
     else
       pass "Post-bootstrap LB config has bootstrap removed from 22623"
@@ -411,13 +441,13 @@ check_lb_config() {
     short="$(tuple_name "${tuple}")"
     fqdn="$(node_fqdn "${short}")"
 
-    if cfg_has_server_port "${cfg}" "${short}" 80 || cfg_has_server_port "${cfg}" "${fqdn}" 80; then
+    if backend_has_server_port "${cfg}" "ingress_http" "${short}" 80 || backend_has_server_port "${cfg}" "ingress_http" "${fqdn}" 80; then
       pass "LB config includes ${short} on 80"
     else
       fail "LB config missing ${short} on 80"
     fi
 
-    if cfg_has_server_port "${cfg}" "${short}" 443 || cfg_has_server_port "${cfg}" "${fqdn}" 443; then
+    if backend_has_server_port "${cfg}" "ingress_https" "${short}" 443 || backend_has_server_port "${cfg}" "ingress_https" "${fqdn}" 443; then
       pass "LB config includes ${short} on 443"
     else
       fail "LB config missing ${short} on 443"
@@ -536,6 +566,7 @@ echo
 if [[ "${ENABLE_LB_SSH_CHECK:-no}" == "yes" ]]; then
   info "Checking load balancer config and listeners over SSH"
   need_cmd ssh
+  check_lb_listeners
   check_lb_config
 else
   warn "LB SSH checks disabled"
