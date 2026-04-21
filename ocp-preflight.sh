@@ -11,13 +11,34 @@ Usage:
   ocp-preflight.sh -h | --help
 
 Options:
-  -c, --config <file>     Path to the configuration file
+  -c, --config <file>     Path to a YAML config file
       --validate-config   Validate configuration and exit without running checks
   -h, --help              Show this help text
 EOF
 }
 
-CONFIG_FILE="./ocp-preflight.conf"
+resolve_default_config() {
+  local candidate
+  for candidate in ./ocp-preflight.yaml ./ocp-preflight.yml; do
+    if [[ -f "${candidate}" ]]; then
+      echo "${candidate}"
+      return
+    fi
+  done
+
+  echo "./ocp-preflight.yaml"
+}
+
+GENERATED_CONFIG=''
+cleanup_generated_config() {
+  if [[ -n "${GENERATED_CONFIG}" && -f "${GENERATED_CONFIG}" ]]; then
+    rm -f "${GENERATED_CONFIG}"
+  fi
+}
+trap cleanup_generated_config EXIT
+
+CONFIG_FILE=''
+CONFIG_FILE_SET='no'
 VALIDATE_ONLY="no"
 
 while (($# > 0)); do
@@ -25,6 +46,7 @@ while (($# > 0)); do
     -c|--config)
       [[ $# -ge 2 ]] || { echo "ERROR: missing value for $1"; usage; exit 2; }
       CONFIG_FILE="$2"
+      CONFIG_FILE_SET='yes'
       shift 2
       ;;
     --validate-config)
@@ -45,16 +67,21 @@ while (($# > 0)); do
       exit 2
       ;;
     *)
-      if [[ "${CONFIG_FILE}" != "./ocp-preflight.conf" ]]; then
+      if [[ "${CONFIG_FILE_SET}" == 'yes' ]]; then
         echo "ERROR: multiple config files provided"
         usage
         exit 2
       fi
       CONFIG_FILE="$1"
+      CONFIG_FILE_SET='yes'
       shift
       ;;
   esac
 done
+
+if [[ "${CONFIG_FILE_SET}" == 'no' ]]; then
+  CONFIG_FILE="$(resolve_default_config)"
+fi
 
 if (($# > 0)); then
   echo "ERROR: unexpected arguments: $*"
@@ -67,13 +94,191 @@ if [[ ! -f "${CONFIG_FILE}" ]]; then
   exit 2
 fi
 
-if ! bash -n "${CONFIG_FILE}" >/dev/null 2>&1; then
-  echo "ERROR: config file has invalid shell syntax: ${CONFIG_FILE}"
+die() {
+  echo "ERROR: $*"
   exit 2
-fi
+}
 
-# shellcheck disable=SC1090
-source "${CONFIG_FILE}"
+need_cmd() {
+  local cmd
+  for cmd in "$@"; do
+    command -v "${cmd}" >/dev/null 2>&1 || die "required command not found: ${cmd}"
+  done
+}
+
+load_yaml_config() {
+  local error_file
+  need_cmd python3
+
+  GENERATED_CONFIG="$(mktemp)"
+  error_file="$(mktemp)"
+
+  if ! python3 - "${CONFIG_FILE}" >"${GENERATED_CONFIG}" 2>"${error_file}" <<'PY'
+import shlex
+import sys
+
+try:
+    import yaml
+except Exception as exc:
+    raise SystemExit(f"YAML config support requires python3 with PyYAML installed ({exc})")
+
+
+def err(message: str) -> None:
+    raise SystemExit(message)
+
+
+def ensure_mapping(value, path):
+    if value is None:
+        return {}
+    if isinstance(value, dict):
+        return value
+    err(f"{path} must be a mapping")
+
+
+def scalar(value, path):
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        err(f"{path} must be a string-like scalar, not a boolean")
+    if isinstance(value, (str, int, float)):
+        return str(value)
+    err(f"{path} must be a string-like scalar")
+
+
+def yes_no(value, path):
+    if value is None:
+        return "no"
+    if isinstance(value, bool):
+        return "yes" if value else "no"
+    if isinstance(value, str):
+        lowered = value.strip().lower()
+        if lowered in {"yes", "true", "on"}:
+            return "yes"
+        if lowered in {"no", "false", "off"}:
+            return "no"
+    err(f"{path} must be true/false or yes/no")
+
+
+def string_list(value, path):
+    if value is None:
+        return []
+    if not isinstance(value, list):
+        err(f"{path} must be a list")
+
+    items = []
+    for index, item in enumerate(value):
+        item_path = f"{path}[{index}]"
+        if isinstance(item, bool):
+            err(f"{item_path} must be a string-like scalar, not a boolean")
+        if not isinstance(item, (str, int, float)):
+            err(f"{item_path} must be a string-like scalar")
+        items.append(str(item))
+    return items
+
+
+def node_tuple(item, path):
+    if isinstance(item, str):
+        return item
+    if isinstance(item, dict):
+        name = scalar(item.get("name"), f"{path}.name")
+        ip = scalar(item.get("ip"), f"{path}.ip")
+        if not name or not ip:
+            err(f"{path} must include both name and ip")
+        return f"{name}:{ip}"
+    err(f"{path} must be 'name:ip' or a mapping with name/ip")
+
+
+def node_list(value, path):
+    if value is None:
+        return []
+    if not isinstance(value, list):
+        err(f"{path} must be a list")
+    return [node_tuple(item, f"{path}[{index}]") for index, item in enumerate(value)]
+
+
+path = sys.argv[1]
+try:
+    with open(path, encoding="utf-8") as handle:
+        data = yaml.safe_load(handle) or {}
+except yaml.YAMLError as exc:
+    raise SystemExit(str(exc))
+
+if not isinstance(data, dict):
+    err("YAML config root must be a mapping")
+
+master_nodes = node_list(data.get("master_nodes"), "master_nodes")
+worker_nodes = node_list(data.get("worker_nodes"), "worker_nodes")
+
+ingress_nodes_value = data.get("ingress_nodes")
+ingress_role = scalar(data.get("ingress_role"), "ingress_role")
+if ingress_nodes_value is not None and ingress_role is not None:
+    err("use either ingress_nodes or ingress_role, not both")
+
+if ingress_nodes_value is not None:
+    ingress_nodes = node_list(ingress_nodes_value, "ingress_nodes")
+elif ingress_role is None:
+    ingress_nodes = []
+else:
+    normalized_role = ingress_role.strip().lower().replace("_", "-")
+    if normalized_role == "workers":
+        ingress_nodes = list(worker_nodes)
+    elif normalized_role in {"masters", "control-plane", "controlplane"}:
+        ingress_nodes = list(master_nodes)
+    else:
+        err("ingress_role must be one of: workers, masters")
+
+load_balancer = ensure_mapping(data.get("load_balancer"), "load_balancer")
+boot_artifacts = ensure_mapping(data.get("boot_artifacts"), "boot_artifacts")
+
+scalars = {
+    "PHASE": scalar(data.get("phase"), "phase"),
+    "DNS_SERVER": scalar(data.get("dns_server"), "dns_server"),
+    "CLUSTER_NAME": scalar(data.get("cluster_name"), "cluster_name"),
+    "BASE_DOMAIN": scalar(data.get("base_domain"), "base_domain"),
+    "API_VIP": scalar(data.get("api_vip"), "api_vip"),
+    "INGRESS_VIP": scalar(data.get("ingress_vip"), "ingress_vip"),
+    "BOOTSTRAP_NODE": node_tuple(data.get("bootstrap_node"), "bootstrap_node"),
+    "ENABLE_LB_SSH_CHECK": yes_no(load_balancer.get("enabled"), "load_balancer.enabled"),
+    "LB_HOST": scalar(load_balancer.get("host"), "load_balancer.host"),
+    "LB_SSH_USER": scalar(load_balancer.get("ssh_user"), "load_balancer.ssh_user"),
+    "HAPROXY_CFG": scalar(load_balancer.get("haproxy_cfg"), "load_balancer.haproxy_cfg"),
+    "ENABLE_BOOT_ARTIFACT_CHECK": yes_no(boot_artifacts.get("enabled"), "boot_artifacts.enabled"),
+    "BOOT_METHOD": scalar(boot_artifacts.get("method"), "boot_artifacts.method"),
+    "REQUIRE_PINNED_NIC": yes_no(boot_artifacts.get("require_pinned_nic"), "boot_artifacts.require_pinned_nic"),
+    "EXPECT_BOOT_NIC": scalar(boot_artifacts.get("expect_boot_nic"), "boot_artifacts.expect_boot_nic"),
+    "EXPECT_INSTALL_DEV": scalar(boot_artifacts.get("expect_install_dev"), "boot_artifacts.expect_install_dev"),
+}
+
+arrays = {
+    "MASTER_NODES": master_nodes,
+    "WORKER_NODES": worker_nodes,
+    "INGRESS_NODES": ingress_nodes,
+    "BOOT_ARTIFACTS": string_list(boot_artifacts.get("artifacts"), "boot_artifacts.artifacts"),
+}
+
+for name, value in scalars.items():
+    if value is not None:
+        print(f"{name}={shlex.quote(value)}")
+
+for name, items in arrays.items():
+    quoted_items = " ".join(shlex.quote(item) for item in items)
+    print(f"{name}=({quoted_items})")
+PY
+  then
+    local error
+    error="$(tr '\n' ' ' < "${error_file}" | sed 's/[[:space:]]\+/ /g; s/^ //; s/ $//')"
+    rm -f "${error_file}" "${GENERATED_CONFIG}"
+    GENERATED_CONFIG=''
+    die "could not parse YAML config ${CONFIG_FILE}: ${error:-unknown error}"
+  fi
+
+  rm -f "${error_file}"
+
+  # shellcheck disable=SC1090
+  source "${GENERATED_CONFIG}"
+}
+
+load_yaml_config
 
 declare -p MASTER_NODES >/dev/null 2>&1 || MASTER_NODES=()
 declare -p WORKER_NODES >/dev/null 2>&1 || WORKER_NODES=()
@@ -88,18 +293,6 @@ pass() { echo "[PASS] $*"; ((PASS_COUNT+=1)); }
 fail() { echo "[FAIL] $*"; ((FAIL_COUNT+=1)); }
 warn() { echo "[WARN] $*"; ((WARN_COUNT+=1)); }
 info() { echo "[INFO] $*"; }
-
-die() {
-  echo "ERROR: $*"
-  exit 2
-}
-
-need_cmd() {
-  local cmd
-  for cmd in "$@"; do
-    command -v "${cmd}" >/dev/null 2>&1 || die "required command not found: ${cmd}"
-  done
-}
 
 is_ipv4() {
   local ip="$1"

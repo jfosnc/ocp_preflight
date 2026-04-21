@@ -1,0 +1,47 @@
+phase: pre-bootstrap
+
+dns_server: 192.168.10.53
+cluster_name: ocp01
+base_domain: lab.example.com
+
+api_vip: 192.168.10.20
+ingress_vip: 192.168.10.21
+
+bootstrap_node:
+  name: bootstrap
+  ip: 192.168.10.30
+
+master_nodes:
+  - name: master0
+    ip: 192.168.10.31
+  - name: master1
+    ip: 192.168.10.32
+  - name: master2
+    ip: 192.168.10.33
+
+worker_nodes:
+  - name: worker0
+    ip: 192.168.10.41
+  - name: worker1
+    ip: 192.168.10.42
+
+# For a normal cluster, use workers.
+# For a 3-node cluster with zero workers, use masters.
+ingress_role: workers
+
+load_balancer:
+  enabled: true
+  host: lb01.lab.example.com
+  ssh_user: core
+  haproxy_cfg: /etc/haproxy/haproxy.cfg
+
+boot_artifacts:
+  enabled: true
+  method: ipxe
+  artifacts:
+    - http://192.168.10.10/boot/bootstrap.ipxe
+    - http://192.168.10.10/boot/master.ipxe
+    - http://192.168.10.10/boot/worker.ipxe
+  require_pinned_nic: true
+  expect_boot_nic: eno1
+  expect_install_dev: /dev/nvme0n1

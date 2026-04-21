@@ -5,7 +5,7 @@
 The repository currently contains:
 
 - `ocp-preflight.sh`: the main preflight script
-- `ocp-preflight.conf`: environment-specific configuration consumed by the script
+- `ocp-preflight.yaml`: the default YAML values file
 - `README.md`: project documentation
 
 ## What It Validates
@@ -40,8 +40,8 @@ The script validates several pieces of install readiness:
 
 The script:
 
-1. Loads a configuration file, defaulting to `./ocp-preflight.conf`
-2. Validates shell syntax and required config values before running checks
+1. Loads a configuration file, defaulting to `./ocp-preflight.yaml`, then `./ocp-preflight.yml`
+2. Validates config structure and required values before running checks
 3. Verifies required local commands are installed
 4. Builds expected cluster FQDNs from `CLUSTER_NAME` and `BASE_DOMAIN`
 5. Executes checks and prints `[PASS]`, `[WARN]`, and `[FAIL]` results
@@ -70,22 +70,27 @@ If `ENABLE_LB_SSH_CHECK="yes"`, it also requires:
 
 - `ssh`
 
+It also requires:
+
+- `python3`
+- PyYAML (`python3-yaml` package on Ubuntu)
+
 ## Configuration
 
-The script sources `ocp-preflight.conf`, so the config file is standard shell syntax.
+The script uses YAML values files such as `ocp-preflight.yaml`. The included sample file uses a structured schema with nested sections for load balancer and boot artifact settings.
 
 ### Install Phase
 
-`PHASE` controls how the bootstrap node is validated in the load balancer:
+`phase` controls how the bootstrap node is validated in the load balancer:
 
 - `pre-bootstrap`: bootstrap must still be present on `6443` and `22623`
 - `post-bootstrap`: bootstrap must be removed from `6443` and `22623`
 
 ### DNS and Cluster Identity
 
-- `DNS_SERVER`: DNS server used for `dig` lookups
-- `CLUSTER_NAME`: OpenShift cluster name
-- `BASE_DOMAIN`: base DNS domain
+- `dns_server`: DNS server used for `dig` lookups
+- `cluster_name`: OpenShift cluster name
+- `base_domain`: base DNS domain
 
 These values combine into:
 
@@ -96,50 +101,45 @@ These values combine into:
 
 ### VIPs
 
-- `API_VIP`: expected IP for `api` and `api-int`
-- `INGRESS_VIP`: expected IP for ingress validation
+- `api_vip`: expected IP for `api` and `api-int`
+- `ingress_vip`: expected IP for ingress validation
 
 ### Node Inventory
 
-Nodes are declared as `shortname:ip` tuples:
+Use objects with `name` and `ip`:
 
-- `BOOTSTRAP_NODE`
-- `MASTER_NODES`
-- `WORKER_NODES`
-
-Example:
-
-```bash
-MASTER_NODES=(
-  "master0:192.168.10.31"
-  "master1:192.168.10.32"
-  "master2:192.168.10.33"
-)
+```yaml
+master_nodes:
+  - name: master0
+    ip: 192.168.10.31
+  - name: master1
+    ip: 192.168.10.32
 ```
 
 ### Ingress Backends
 
-`INGRESS_NODES` defines which nodes should serve ports `80` and `443` on the load balancer.
+You can use either:
+
+- `ingress_nodes`: explicit list of node objects
+- `ingress_role`: `workers` or `masters`
 
 Typical patterns:
 
 - standard cluster: workers
 - compact or 3-node cluster: masters
 
-Example:
-
-```bash
-INGRESS_NODES=("${WORKER_NODES[@]}")
+```yaml
+ingress_role: workers
 ```
 
 ### Optional Load Balancer Checks
 
 These settings enable and control SSH-based HAProxy validation:
 
-- `ENABLE_LB_SSH_CHECK`
-- `LB_HOST`
-- `LB_SSH_USER`
-- `HAPROXY_CFG`
+- `load_balancer.enabled`
+- `load_balancer.host`
+- `load_balancer.ssh_user`
+- `load_balancer.haproxy_cfg`
 
 When enabled, the script attempts to:
 
@@ -156,12 +156,12 @@ Listener checks and backend membership checks are attempted independently.
 
 These settings enable validation of PXE, iPXE, or generic boot artifacts:
 
-- `ENABLE_BOOT_ARTIFACT_CHECK`
-- `BOOT_METHOD`
-- `BOOT_ARTIFACTS`
-- `REQUIRE_PINNED_NIC`
-- `EXPECT_BOOT_NIC`
-- `EXPECT_INSTALL_DEV`
+- `boot_artifacts.enabled`
+- `boot_artifacts.method`
+- `boot_artifacts.artifacts`
+- `boot_artifacts.require_pinned_nic`
+- `boot_artifacts.expect_boot_nic`
+- `boot_artifacts.expect_install_dev`
 
 Supported `BOOT_METHOD` values in the config are:
 
@@ -187,13 +187,13 @@ bash ./ocp-preflight.sh
 Run with a custom config file:
 
 ```bash
-bash ./ocp-preflight.sh /path/to/ocp-preflight.conf
+bash ./ocp-preflight.sh /path/to/ocp-preflight.yaml
 ```
 
 Run with an explicit flag:
 
 ```bash
-bash ./ocp-preflight.sh --config /path/to/ocp-preflight.conf
+bash ./ocp-preflight.sh --config /path/to/ocp-preflight.yaml
 ```
 
 Validate only, without running network checks:
@@ -202,7 +202,7 @@ Validate only, without running network checks:
 bash ./ocp-preflight.sh --validate-config
 ```
 
-In `--validate-config` mode, the script validates shell syntax and config values without requiring runtime tools such as `dig`, `curl`, or `nc`.
+In `--validate-config` mode, the script validates config structure and values without requiring runtime tools such as `dig`, `curl`, or `nc`.
 
 Show help:
 
@@ -217,13 +217,14 @@ The repository includes a GitHub Actions workflow at [lint.yml](/c:/Users/jfosn/
 It currently performs:
 
 - `bash -n ocp-preflight.sh`
-- `bash -n ocp-preflight.conf`
+- `bash ./ocp-preflight.sh --validate-config ocp-preflight.yaml`
 - `shellcheck ocp-preflight.sh`
 - `bash tests/run-tests.sh`
 
 The test runner at [run-tests.sh](/c:/Users/jfosn/OneDrive/Documents/work/ocp_preflight/tests/run-tests.sh:1) uses mocked `dig`, `curl`, `nc`, and `ssh` commands to validate:
 
 - config parsing success and failure cases
+- YAML config parsing and execution paths
 - pre-bootstrap HAProxy membership expectations
 - post-bootstrap HAProxy membership expectations
 
@@ -231,15 +232,15 @@ The test runner at [run-tests.sh](/c:/Users/jfosn/OneDrive/Documents/work/ocp_pr
 
 Before any runtime checks execute, the script validates:
 
-- the config file exists and has valid shell syntax
-- `PHASE` is `pre-bootstrap` or `post-bootstrap`
-- `DNS_SERVER`, `API_VIP`, and `INGRESS_VIP` are valid IPv4 addresses
+- the config file exists and has valid YAML syntax
+- `phase` is `pre-bootstrap` or `post-bootstrap`
+- `dns_server`, `api_vip`, and `ingress_vip` are valid IPv4 addresses
 - required top-level values are non-empty
-- node entries use `shortname:ip` format
+- node entries include both `name` and `ip`
 - yes or no toggles use `yes` or `no`
 - load balancer settings are present when LB SSH checks are enabled
 - boot artifact settings are present and valid when boot artifact checks are enabled
-- `EXPECT_BOOT_NIC` is set when pinned NIC validation is enabled
+- `expect_boot_nic` is set when pinned NIC validation is enabled
 
 ## Example Output
 
@@ -260,14 +261,14 @@ FAIL: 0
 
 A few implementation details are worth knowing if you plan to extend this project:
 
-- The script is intended to be sourced with shell-style configuration, so malformed config syntax will break execution.
+- The script parses YAML into shell variables internally before running validation.
 - DNS validation uses only the configured `DNS_SERVER`, not the system resolver.
 - Ignition endpoint checks use HTTPS against `api-int.<cluster domain>:22623` and accept the endpoint certificate with `curl -k`, which is useful during early install stages.
 - The ingress DNS check validates `wildcard-preflight.apps.<cluster domain>` against `INGRESS_VIP` so wildcard apps resolution is exercised directly.
 
 ## Suggested Workflow
 
-1. Copy `ocp-preflight.conf` and tailor it to the target environment.
+1. Copy `ocp-preflight.yaml` and tailor it to the target environment.
 2. Run the script from an installer or admin workstation that has network access to the VIPs, DNS server, and load balancer.
 3. Resolve any `[FAIL]` results before proceeding with installation.
 4. Re-run after infrastructure changes or after the bootstrap phase transitions.

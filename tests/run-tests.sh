@@ -170,30 +170,42 @@ write_config() {
   local path="$1"
   local phase="$2"
   local enable_lb="${3:-yes}"
+  local lb_enabled='true'
+
+  if [[ "${enable_lb}" != "yes" ]]; then
+    lb_enabled='false'
+  fi
+
   cat > "${path}" <<EOF
-PHASE="${phase}"
-DNS_SERVER="192.168.10.53"
-CLUSTER_NAME="ocp01"
-BASE_DOMAIN="lab.example.com"
-API_VIP="192.168.10.20"
-INGRESS_VIP="192.168.10.21"
-BOOTSTRAP_NODE="bootstrap:192.168.10.30"
-MASTER_NODES=(
-  "master0:192.168.10.31"
-  "master1:192.168.10.32"
-  "master2:192.168.10.33"
-)
-WORKER_NODES=(
-  "worker0:192.168.10.41"
-  "worker1:192.168.10.42"
-)
-INGRESS_NODES=("\${WORKER_NODES[@]}")
-ENABLE_LB_SSH_CHECK="${enable_lb}"
-LB_HOST="lb01.lab.example.com"
-LB_SSH_USER="core"
-HAPROXY_CFG="/etc/haproxy/haproxy.cfg"
-ENABLE_BOOT_ARTIFACT_CHECK="no"
-REQUIRE_PINNED_NIC="no"
+phase: ${phase}
+dns_server: 192.168.10.53
+cluster_name: ocp01
+base_domain: lab.example.com
+api_vip: 192.168.10.20
+ingress_vip: 192.168.10.21
+bootstrap_node:
+  name: bootstrap
+  ip: 192.168.10.30
+master_nodes:
+  - name: master0
+    ip: 192.168.10.31
+  - name: master1
+    ip: 192.168.10.32
+  - name: master2
+    ip: 192.168.10.33
+worker_nodes:
+  - name: worker0
+    ip: 192.168.10.41
+  - name: worker1
+    ip: 192.168.10.42
+ingress_role: workers
+load_balancer:
+  enabled: ${lb_enabled}
+  host: lb01.lab.example.com
+  ssh_user: core
+  haproxy_cfg: /etc/haproxy/haproxy.cfg
+boot_artifacts:
+  enabled: false
 EOF
 }
 
@@ -309,45 +321,64 @@ run_test() {
 test_validate_config_success() {
   setup_test_env
   : > "${TEST_TMP}/http-body.txt"
-  write_config "${TEST_TMP}/config.conf" "pre-bootstrap" "no"
+  write_config "${TEST_TMP}/config.yaml" "pre-bootstrap" "no"
   write_haproxy_cfg "${TEST_TMP}/haproxy.cfg" "pre-bootstrap"
 
   local output="${TEST_TMP}/output.txt"
   local status
-  status="$(run_script "${output}" --validate-config "${TEST_TMP}/config.conf")"
+  status="$(run_script "${output}" --validate-config "${TEST_TMP}/config.yaml")"
 
   assert_exit_code "${status}" "0" "validate-config success"
-  assert_contains "${output}" "[INFO] Configuration is valid: ${TEST_TMP}/config.conf" "validate-config success"
+  assert_contains "${output}" "[INFO] Configuration is valid: ${TEST_TMP}/config.yaml" "validate-config success"
 }
 
 test_validate_config_does_not_require_runtime_commands() {
   setup_test_env
   : > "${TEST_TMP}/http-body.txt"
-  write_config "${TEST_TMP}/config.conf" "pre-bootstrap" "no"
+  write_config "${TEST_TMP}/config.yaml" "pre-bootstrap" "no"
   write_haproxy_cfg "${TEST_TMP}/haproxy.cfg" "pre-bootstrap"
 
-  mkdir -p "${TEST_TMP}/bash-only-bin"
-  ln -s "$(command -v bash)" "${TEST_TMP}/bash-only-bin/bash"
-  RUN_SCRIPT_PATH="${TEST_TMP}/bash-only-bin"
+  mkdir -p "${TEST_TMP}/yaml-only-bin"
+  ln -s "$(command -v bash)" "${TEST_TMP}/yaml-only-bin/bash"
+  ln -s "$(command -v python3)" "${TEST_TMP}/yaml-only-bin/python3"
+  ln -s "$(command -v mktemp)" "${TEST_TMP}/yaml-only-bin/mktemp"
+  ln -s "$(command -v rm)" "${TEST_TMP}/yaml-only-bin/rm"
+  RUN_SCRIPT_PATH="${TEST_TMP}/yaml-only-bin"
+
+  local output="${TEST_TMP}/output.txt"
+  local status
+  status="$(run_script "${output}" --validate-config "${TEST_TMP}/config.yaml")"
+
+  assert_exit_code "${status}" "0" "validate-config without runtime commands"
+  assert_contains "${output}" "[INFO] Configuration is valid: ${TEST_TMP}/config.yaml" "validate-config without runtime commands"
+  assert_not_contains "${output}" "required command not found" "validate-config without runtime commands"
+}
+
+test_shell_config_is_rejected() {
+  setup_test_env
+  : > "${TEST_TMP}/http-body.txt"
+  cat > "${TEST_TMP}/config.conf" <<'EOF'
+PHASE="pre-bootstrap"
+DNS_SERVER="192.168.10.53"
+EOF
 
   local output="${TEST_TMP}/output.txt"
   local status
   status="$(run_script "${output}" --validate-config "${TEST_TMP}/config.conf")"
 
-  assert_exit_code "${status}" "0" "validate-config without runtime commands"
-  assert_contains "${output}" "[INFO] Configuration is valid: ${TEST_TMP}/config.conf" "validate-config without runtime commands"
-  assert_not_contains "${output}" "required command not found" "validate-config without runtime commands"
+  assert_exit_code "${status}" "2" "shell config is rejected"
+  assert_contains "${output}" "ERROR: could not parse YAML config ${TEST_TMP}/config.conf:" "shell config is rejected"
 }
 
 test_validate_config_rejects_invalid_phase() {
   setup_test_env
   : > "${TEST_TMP}/http-body.txt"
-  write_config "${TEST_TMP}/config.conf" "during-install" "no"
+  write_config "${TEST_TMP}/config.yaml" "during-install" "no"
   write_haproxy_cfg "${TEST_TMP}/haproxy.cfg" "pre-bootstrap"
 
   local output="${TEST_TMP}/output.txt"
   local status
-  status="$(run_script "${output}" --validate-config "${TEST_TMP}/config.conf")"
+  status="$(run_script "${output}" --validate-config "${TEST_TMP}/config.yaml")"
 
   assert_exit_code "${status}" "2" "invalid phase config"
   assert_contains "${output}" "ERROR: PHASE must be 'pre-bootstrap' or 'post-bootstrap', got 'during-install'" "invalid phase config"
@@ -356,15 +387,13 @@ test_validate_config_rejects_invalid_phase() {
 test_validate_config_rejects_missing_lb_host() {
   setup_test_env
   : > "${TEST_TMP}/http-body.txt"
-  write_config "${TEST_TMP}/config.conf" "pre-bootstrap" "yes"
+  write_config "${TEST_TMP}/config.yaml" "pre-bootstrap" "yes"
   write_haproxy_cfg "${TEST_TMP}/haproxy.cfg" "pre-bootstrap"
-  cat >> "${TEST_TMP}/config.conf" <<'EOF'
-LB_HOST=""
-EOF
+  sed -i 's/^  host: .*/  host: ""/' "${TEST_TMP}/config.yaml"
 
   local output="${TEST_TMP}/output.txt"
   local status
-  status="$(run_script "${output}" --validate-config "${TEST_TMP}/config.conf")"
+  status="$(run_script "${output}" --validate-config "${TEST_TMP}/config.yaml")"
 
   assert_exit_code "${status}" "2" "missing lb host"
   assert_contains "${output}" "ERROR: required config value is empty: LB_HOST" "missing lb host"
@@ -373,12 +402,12 @@ EOF
 test_pre_bootstrap_lb_logic() {
   setup_test_env
   : > "${TEST_TMP}/http-body.txt"
-  write_config "${TEST_TMP}/config.conf" "pre-bootstrap" "yes"
+  write_config "${TEST_TMP}/config.yaml" "pre-bootstrap" "yes"
   write_haproxy_cfg "${TEST_TMP}/haproxy.cfg" "pre-bootstrap"
 
   local output="${TEST_TMP}/output.txt"
   local status
-  status="$(run_script "${output}" "${TEST_TMP}/config.conf")"
+  status="$(run_script "${output}" "${TEST_TMP}/config.yaml")"
 
   assert_exit_code "${status}" "0" "pre-bootstrap run"
   assert_contains "${output}" "[PASS] Pre-bootstrap LB config includes bootstrap on 6443" "pre-bootstrap lb membership"
@@ -389,13 +418,13 @@ test_pre_bootstrap_lb_logic() {
 test_lb_listener_checks_run_when_config_read_fails() {
   setup_test_env
   : > "${TEST_TMP}/http-body.txt"
-  write_config "${TEST_TMP}/config.conf" "pre-bootstrap" "yes"
+  write_config "${TEST_TMP}/config.yaml" "pre-bootstrap" "yes"
   write_haproxy_cfg "${TEST_TMP}/haproxy.cfg" "pre-bootstrap"
   MOCK_SSH_CAT_FAIL='yes'
 
   local output="${TEST_TMP}/output.txt"
   local status
-  status="$(run_script "${output}" "${TEST_TMP}/config.conf")"
+  status="$(run_script "${output}" "${TEST_TMP}/config.yaml")"
 
   assert_exit_code "${status}" "0" "lb listeners still run when config read fails"
   assert_contains "${output}" "[PASS] Load balancer is listening on 6443" "lb listeners still run when config read fails"
@@ -407,7 +436,7 @@ test_lb_listener_checks_run_when_config_read_fails() {
 test_lb_backend_membership_requires_correct_backends() {
   setup_test_env
   : > "${TEST_TMP}/http-body.txt"
-  write_config "${TEST_TMP}/config.conf" "pre-bootstrap" "yes"
+  write_config "${TEST_TMP}/config.yaml" "pre-bootstrap" "yes"
   cat > "${TEST_TMP}/haproxy.cfg" <<'EOF'
 backend not_api
   option httpchk GET /readyz
@@ -429,7 +458,7 @@ EOF
 
   local output="${TEST_TMP}/output.txt"
   local status
-  status="$(run_script "${output}" "${TEST_TMP}/config.conf")"
+  status="$(run_script "${output}" "${TEST_TMP}/config.yaml")"
 
   assert_exit_code "${status}" "1" "lb backend membership requires correct backends"
   assert_contains "${output}" "[FAIL] LB config missing master0 on 6443" "lb backend membership requires correct backends"
@@ -439,12 +468,12 @@ EOF
 test_post_bootstrap_lb_logic() {
   setup_test_env
   : > "${TEST_TMP}/http-body.txt"
-  write_config "${TEST_TMP}/config.conf" "post-bootstrap" "yes"
+  write_config "${TEST_TMP}/config.yaml" "post-bootstrap" "yes"
   write_haproxy_cfg "${TEST_TMP}/haproxy.cfg" "post-bootstrap"
 
   local output="${TEST_TMP}/output.txt"
   local status
-  status="$(run_script "${output}" "${TEST_TMP}/config.conf")"
+  status="$(run_script "${output}" "${TEST_TMP}/config.yaml")"
 
   assert_exit_code "${status}" "0" "post-bootstrap run"
   assert_contains "${output}" "[PASS] Post-bootstrap LB config has bootstrap removed from 6443" "post-bootstrap lb membership"
@@ -455,6 +484,7 @@ test_post_bootstrap_lb_logic() {
 main() {
   run_test "validate config succeeds" test_validate_config_success
   run_test "validate-only skips runtime command dependencies" test_validate_config_does_not_require_runtime_commands
+  run_test "legacy shell config is rejected" test_shell_config_is_rejected
   run_test "invalid phase is rejected" test_validate_config_rejects_invalid_phase
   run_test "missing LB host is rejected" test_validate_config_rejects_missing_lb_host
   run_test "pre-bootstrap LB membership passes" test_pre_bootstrap_lb_logic
